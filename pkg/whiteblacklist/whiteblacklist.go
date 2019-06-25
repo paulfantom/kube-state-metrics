@@ -1,17 +1,36 @@
+/*
+Copyright 2018 The Kubernetes Authors All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package whiteblacklist
 
 import (
-	"errors"
+	"regexp"
 	"strings"
+
+	"github.com/pkg/errors"
 )
 
 // WhiteBlackList encapsulates the logic needed to filter based on a string.
 type WhiteBlackList struct {
 	list        map[string]struct{}
+	rList       []regexp.Regexp
 	isWhiteList bool
 }
 
-// New constructs a new WhtieBlackList based on a white- and a
+// New constructs a new WhiteBlackList based on a white- and a
 // blacklist. Only one of them can be not empty.
 func New(w, b map[string]struct{}) (*WhiteBlackList, error) {
 	if len(w) != 0 && len(b) != 0 {
@@ -39,6 +58,20 @@ func New(w, b map[string]struct{}) (*WhiteBlackList, error) {
 		list:        list,
 		isWhiteList: isWhiteList,
 	}, nil
+}
+
+// Parse parses and compiles all of the regexes in the whiteBlackList.
+func (l *WhiteBlackList) Parse() error {
+	var regexes []regexp.Regexp
+	for item := range l.list {
+		r, err := regexp.Compile(item)
+		if err != nil {
+			return err
+		}
+		regexes = append(regexes, *r)
+	}
+	l.rList = regexes
+	return nil
 }
 
 // Include includes the given items in the list.
@@ -69,13 +102,19 @@ func (l *WhiteBlackList) Exclude(items []string) {
 
 // IsIncluded returns if the given item is included.
 func (l *WhiteBlackList) IsIncluded(item string) bool {
-	_, exists := l.list[item]
-
-	if l.isWhiteList {
-		return exists
+	var matched bool
+	for _, r := range l.rList {
+		matched = r.MatchString(item)
+		if matched {
+			break
+		}
 	}
 
-	return !exists
+	if l.isWhiteList {
+		return matched
+	}
+
+	return !matched
 }
 
 // IsExcluded returns if the given item is excluded.
@@ -83,7 +122,7 @@ func (l *WhiteBlackList) IsExcluded(item string) bool {
 	return !l.IsIncluded(item)
 }
 
-// Status returns the status of the WhtieBlackList that can e.g. be passed into
+// Status returns the status of the WhiteBlackList that can e.g. be passed into
 // a logger.
 func (l *WhiteBlackList) Status() string {
 	items := []string{}

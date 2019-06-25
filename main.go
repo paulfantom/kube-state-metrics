@@ -29,15 +29,18 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/golang/glog"
 	"github.com/openshift/origin/pkg/util/proc"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	vpaclientset "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/client/clientset/versioned"
 	clientset "k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	"k8s.io/client-go/tools/clientcmd"
-
-	kcollectors "k8s.io/kube-state-metrics/pkg/collectors"
+	"k8s.io/klog"
+	"k8s.io/kube-state-metrics/internal/store"
+	metricsstore "k8s.io/kube-state-metrics/pkg/metrics_store"
 	"k8s.io/kube-state-metrics/pkg/options"
 	"k8s.io/kube-state-metrics/pkg/version"
 	"k8s.io/kube-state-metrics/pkg/whiteblacklist"
@@ -52,16 +55,19 @@ const (
 type promLogger struct{}
 
 func (pl promLogger) Println(v ...interface{}) {
-	glog.Error(v...)
+	klog.Error(v...)
 }
 
 func main() {
 	opts := options.NewOptions()
 	opts.AddFlags()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	err := opts.Parse()
 	if err != nil {
-		glog.Fatalf("Error: %s", err)
+		klog.Fatalf("Error: %s", err)
 	}
 
 	if opts.Version {
@@ -74,31 +80,36 @@ func main() {
 		os.Exit(0)
 	}
 
-	collectorBuilder := kcollectors.NewBuilder(context.TODO())
+	storeBuilder := store.NewBuilder(ctx)
 
+	var collectors []string
 	if len(opts.Collectors) == 0 {
-		glog.Info("Using default collectors")
-		collectorBuilder.WithEnabledCollectors(options.DefaultCollectors.AsSlice())
+		klog.Info("Using default collectors")
+		collectors = options.DefaultCollectors.AsSlice()
 	} else {
-		glog.Infof("Using collectors %s", opts.Collectors.String())
-		collectorBuilder.WithEnabledCollectors(opts.Collectors.AsSlice())
+		klog.Infof("Using collectors %s", opts.Collectors.String())
+		collectors = opts.Collectors.AsSlice()
+	}
+
+	if err := storeBuilder.WithEnabledResources(collectors); err != nil {
+		klog.Fatalf("Failed to set up collectors: %v", err)
 	}
 
 	if len(opts.Namespaces) == 0 {
-		glog.Info("Using all namespace")
-		collectorBuilder.WithNamespaces(options.DefaultNamespaces)
+		klog.Info("Using all namespace")
+		storeBuilder.WithNamespaces(options.DefaultNamespaces)
 	} else {
 		if opts.Namespaces.IsAllNamespaces() {
-			glog.Info("Using all namespace")
+			klog.Info("Using all namespace")
 		} else {
-			glog.Infof("Using %s namespaces", opts.Namespaces)
+			klog.Infof("Using %s namespaces", opts.Namespaces)
 		}
-		collectorBuilder.WithNamespaces(opts.Namespaces)
+		storeBuilder.WithNamespaces(opts.Namespaces)
 	}
 
 	whiteBlackList, err := whiteblacklist.New(opts.MetricWhitelist, opts.MetricBlacklist)
 	if err != nil {
-		glog.Fatal(err)
+		klog.Fatal(err)
 	}
 
 	if opts.DisablePodNonGenericResourceMetrics {
@@ -121,34 +132,38 @@ func main() {
 		})
 	}
 
-	glog.Infof("metric white-blacklisting: %v", whiteBlackList.Status())
+	err = whiteBlackList.Parse()
+	if err != nil {
+		klog.Fatalf("error initializing the whiteblack list : %v", err)
+	}
 
-	collectorBuilder.WithWhiteBlackList(whiteBlackList)
+	klog.Infof("metric white-blacklisting: %v", whiteBlackList.Status())
+
+	storeBuilder.WithWhiteBlackList(whiteBlackList)
 
 	proc.StartReaper()
 
-	kubeClient, err := createKubeClient(opts.Apiserver, opts.Kubeconfig)
+	kubeClient, vpaClient, err := createKubeClient(opts.Apiserver, opts.Kubeconfig)
 	if err != nil {
-		glog.Fatalf("Failed to create client: %v", err)
+		klog.Fatalf("Failed to create client: %v", err)
 	}
-	collectorBuilder.WithKubeClient(kubeClient)
+	storeBuilder.WithKubeClient(kubeClient)
+	storeBuilder.WithVPAClient(vpaClient)
 
 	ksmMetricsRegistry := prometheus.NewRegistry()
-	ksmMetricsRegistry.Register(kcollectors.ResourcesPerScrapeMetric)
-	ksmMetricsRegistry.Register(kcollectors.ScrapeErrorTotalMetric)
-	ksmMetricsRegistry.Register(prometheus.NewProcessCollector(os.Getpid(), ""))
+	ksmMetricsRegistry.Register(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
 	ksmMetricsRegistry.Register(prometheus.NewGoCollector())
 	go telemetryServer(ksmMetricsRegistry, opts.TelemetryHost, opts.TelemetryPort)
 
-	collectors := collectorBuilder.Build()
+	stores := storeBuilder.Build()
 
-	serveMetrics(collectors, opts.Host, opts.Port, opts.EnableGZIPEncoding)
+	serveMetrics(stores, opts.Host, opts.Port, opts.EnableGZIPEncoding)
 }
 
-func createKubeClient(apiserver string, kubeconfig string) (clientset.Interface, error) {
+func createKubeClient(apiserver string, kubeconfig string) (clientset.Interface, vpaclientset.Interface, error) {
 	config, err := clientcmd.BuildConfigFromFlags(apiserver, kubeconfig)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	config.UserAgent = version.GetVersion().String()
@@ -157,29 +172,33 @@ func createKubeClient(apiserver string, kubeconfig string) (clientset.Interface,
 
 	kubeClient, err := clientset.NewForConfig(config)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
+	vpaClient, err := vpaclientset.NewForConfig(config)
+	if err != nil {
+		return nil, nil, err
+	}
 	// Informers don't seem to do a good job logging error messages when it
 	// can't reach the server, making debugging hard. This makes it easier to
 	// figure out if apiserver is configured incorrectly.
-	glog.Infof("Testing communication with server")
+	klog.Infof("Testing communication with server")
 	v, err := kubeClient.Discovery().ServerVersion()
 	if err != nil {
-		return nil, fmt.Errorf("ERROR communicating with apiserver: %v", err)
+		return nil, nil, errors.Wrap(err, "error while trying to communicate with apiserver")
 	}
-	glog.Infof("Running with Kubernetes cluster version: v%s.%s. git version: %s. git tree state: %s. commit: %s. platform: %s",
+	klog.Infof("Running with Kubernetes cluster version: v%s.%s. git version: %s. git tree state: %s. commit: %s. platform: %s",
 		v.Major, v.Minor, v.GitVersion, v.GitTreeState, v.GitCommit, v.Platform)
-	glog.Infof("Communication with server successful")
+	klog.Infof("Communication with server successful")
 
-	return kubeClient, nil
+	return kubeClient, vpaClient, nil
 }
 
 func telemetryServer(registry prometheus.Gatherer, host string, port int) {
 	// Address to listen on for web interface and telemetry
 	listenAddress := net.JoinHostPort(host, strconv.Itoa(port))
 
-	glog.Infof("Starting kube-state-metrics self metrics server: %s", listenAddress)
+	klog.Infof("Starting kube-state-metrics self metrics server: %s", listenAddress)
 
 	mux := http.NewServeMux()
 
@@ -200,12 +219,11 @@ func telemetryServer(registry prometheus.Gatherer, host string, port int) {
 	log.Fatal(http.ListenAndServe(listenAddress, mux))
 }
 
-// TODO: How about accepting an interface Collector instead?
-func serveMetrics(collectors []*kcollectors.Collector, host string, port int, enableGZIPEncoding bool) {
+func serveMetrics(stores []*metricsstore.MetricsStore, host string, port int, enableGZIPEncoding bool) {
 	// Address to listen on for web interface and telemetry
 	listenAddress := net.JoinHostPort(host, strconv.Itoa(port))
 
-	glog.Infof("Starting metrics server: %s", listenAddress)
+	klog.Infof("Starting metrics server: %s", listenAddress)
 
 	mux := http.NewServeMux()
 
@@ -217,11 +235,11 @@ func serveMetrics(collectors []*kcollectors.Collector, host string, port int, en
 	mux.Handle("/debug/pprof/trace", http.HandlerFunc(pprof.Trace))
 
 	// Add metricsPath
-	mux.Handle(metricsPath, &metricHandler{collectors, enableGZIPEncoding})
+	mux.Handle(metricsPath, &metricHandler{stores, enableGZIPEncoding})
 	// Add healthzPath
 	mux.HandleFunc(healthzPath, func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-		w.Write([]byte("ok"))
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(http.StatusText(http.StatusOK)))
 	})
 	// Add index
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -240,7 +258,7 @@ func serveMetrics(collectors []*kcollectors.Collector, host string, port int, en
 }
 
 type metricHandler struct {
-	collectors         []*kcollectors.Collector
+	stores             []*metricsstore.MetricsStore
 	enableGZIPEncoding bool
 }
 
@@ -248,6 +266,8 @@ func (m *metricHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resHeader := w.Header()
 	var writer io.Writer = w
 
+	// Set the exposition format version of Prometheus.
+	// https://prometheus.io/docs/instrumenting/exposition_formats/#text-based-format
 	resHeader.Set("Content-Type", `text/plain; version=`+"0.0.4")
 
 	if m.enableGZIPEncoding {
@@ -264,11 +284,11 @@ func (m *metricHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	for _, c := range m.collectors {
-		c.Collect(w)
+	for _, c := range m.stores {
+		c.WriteAll(w)
 	}
 
-	// In case we gziped the response, we have to close the writer.
+	// In case we gzipped the response, we have to close the writer.
 	if closer, ok := writer.(io.Closer); ok {
 		closer.Close()
 	}
